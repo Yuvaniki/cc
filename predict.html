@@ -1,0 +1,269 @@
+"""
+Flask app that trains several classifiers, selects the best by cross-validated f1-score,
+and exposes a /predict route that uses the best model. Save this file as `app.py`.
+Place your HTML template (the one you provided) in `templates/predict.html` and
+static files in `static/`.
+
+Run training once with: python app.py --train
+Then start server normally: python app.py
+
+Requirements (pip): flask scikit-learn pandas joblib numpy
+"""
+
+import os
+import json
+import argparse
+from flask import Flask, render_template, request, session, redirect, url_for
+import pandas as pd
+import numpy as np
+from joblib import dump, load
+
+from sklearn.model_selection import StratifiedKFold, cross_val_score, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# ---------- Configuration ----------
+DATA_PATH = os.path.join("data", "chronic_disease_data.csv")  # put your dataset here
+MODELS_DIR = "models"
+os.makedirs(MODELS_DIR, exist_ok=True)
+BEST_MODEL_PATH = os.path.join(MODELS_DIR, "best_pipeline.joblib")
+MODEL_META_PATH = os.path.join(MODELS_DIR, "model_meta.json")
+
+# Feature order expected by the form/template
+FEATURE_ORDER = [
+    'age', 'gender', 'bmi', 'blood_pressure', 'cholesterol_level', 'glucose_level',
+    'physical_activity', 'smoking_status', 'alcohol_intake', 'family_history',
+    'biomarker_A', 'biomarker_B', 'biomarker_C', 'biomarker_D'
+]
+
+# ---------- Training utility ----------
+
+def load_dataset(path=DATA_PATH):
+    df = pd.read_csv(path)
+    # assume the dataset contains the same column names as FEATURE_ORDER and a target column named 'target'
+    if 'target' not in df.columns:
+        raise ValueError("Dataset must contain a 'target' column with the label (0/1).")
+    return df
+
+
+def build_preprocessor():
+    # numeric and categorical columns
+    numeric_features = ['age', 'bmi', 'blood_pressure', 'cholesterol_level', 'glucose_level',
+                        'physical_activity', 'alcohol_intake', 'biomarker_A', 'biomarker_B',
+                        'biomarker_C', 'biomarker_D']
+    categorical_features = ['gender', 'smoking_status', 'family_history']
+
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+
+    preprocessor = ColumnTransformer(transformers=[
+        ('num', numeric_transformer, numeric_features),
+        ('cat', categorical_transformer, categorical_features)
+    ])
+
+    return preprocessor
+
+
+def candidate_classifiers():
+    # Keep parameter grids small to run in reasonable time
+    return {
+        'LogisticRegression': (LogisticRegression(max_iter=1000),
+                               {'clf__C': [0.1, 1, 10]}),
+        'SVC': (SVC(probability=True),
+                {'clf__C': [0.1, 1], 'clf__kernel': ['rbf', 'linear']}),
+        'GaussianNB': (GaussianNB(), {}),
+        'DecisionTree': (DecisionTreeClassifier(), {'clf__max_depth': [3, 6, None]}),
+        'RandomForest': (RandomForestClassifier(), {'clf__n_estimators': [100, 200], 'clf__max_depth': [5, None]})
+    }
+
+
+def evaluate_and_select_best(X, y):
+    preprocessor = build_preprocessor()
+    candidates = candidate_classifiers()
+
+    best_name = None
+    best_score = -1
+    best_pipeline = None
+    best_metrics = {}
+
+    # use stratified kfold and f1 as primary metric
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    for name, (clf, grid) in candidates.items():
+        pipe = Pipeline(steps=[('preproc', preprocessor), ('clf', clf)])
+
+        if grid:
+            search = GridSearchCV(pipe, param_grid=grid, cv=cv, scoring='f1', n_jobs=-1)
+            search.fit(X, y)
+            model = search.best_estimator_
+            cv_score = search.best_score_
+        else:
+            # quick cross-val evaluation
+            scores = cross_val_score(pipe, X, y, cv=cv, scoring='f1', n_jobs=-1)
+            pipe.fit(X, y)
+            model = pipe
+            cv_score = scores.mean()
+
+        # compute additional metrics via cross_val_score where relevant
+        acc = cross_val_score(model, X, y, cv=cv, scoring='accuracy', n_jobs=-1).mean()
+        prec = cross_val_score(model, X, y, cv=cv, scoring='precision', n_jobs=-1).mean()
+        rec = cross_val_score(model, X, y, cv=cv, scoring='recall', n_jobs=-1).mean()
+        f1 = cv_score
+
+        print(f"{name}: acc={acc:.4f} prec={prec:.4f} rec={rec:.4f} f1={f1:.4f}")
+
+        if f1 > best_score:
+            best_score = f1
+            best_name = name
+            best_pipeline = model
+            best_metrics = {'accuracy': float(acc), 'precision': float(prec), 'recall': float(rec), 'f1': float(f1)}
+
+    return best_name, best_pipeline, best_metrics
+
+
+def train_and_save_best():
+    df = load_dataset()
+    X = df[FEATURE_ORDER]
+    y = df['target']
+
+    best_name, best_pipeline, best_metrics = evaluate_and_select_best(X, y)
+
+    # fit the chosen pipeline on the full dataset
+    best_pipeline.fit(X, y)
+
+    dump(best_pipeline, BEST_MODEL_PATH)
+
+    metadata = {
+        'model_name': best_name,
+        'metrics': best_metrics,
+        'feature_order': FEATURE_ORDER
+    }
+
+    with open(MODEL_META_PATH, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"Saved best model: {best_name} -> {BEST_MODEL_PATH}")
+    print(json.dumps(metadata, indent=2))
+
+# ---------- Flask app ----------
+
+app = Flask(__name__)
+app.secret_key = 'supersecretkey'  # change in production
+
+# load model and metadata if present
+MODEL = None
+MODEL_META = None
+
+
+def load_model():
+    global MODEL, MODEL_META
+    if os.path.exists(BEST_MODEL_PATH) and os.path.exists(MODEL_META_PATH):
+        try:
+            MODEL = load(BEST_MODEL_PATH)
+            with open(MODEL_META_PATH, 'r') as f:
+                MODEL_META = json.load(f)
+            print(f"Loaded model: {MODEL_META.get('model_name')}")
+        except Exception as e:
+            print("Failed to load model:", e)
+            MODEL = None
+            MODEL_META = None
+    else:
+        MODEL = None
+        MODEL_META = None
+
+
+@app.route('/')
+def home():
+    # pass empty prediction_text on first load
+    return render_template('predict.html', prediction_text=None, report_data=None)
+
+
+@app.route('/train', methods=['GET', 'POST'])
+def train_route():
+    # web-trigger for training (careful: could take time)
+    if request.method == 'POST':
+        train_and_save_best()
+        load_model()
+        return redirect(url_for('home'))
+    return render_template('train.html')
+
+
+@app.route('/predict', methods=['POST'])
+def predict_page():
+    global MODEL, MODEL_META
+    if MODEL is None:
+        return render_template('predict.html', prediction_text='Model not trained yet. Run training first.', report_data=None)
+
+    try:
+        # read form values in the same order as FEATURE_ORDER
+        values = []
+        for feat in FEATURE_ORDER:
+            raw = request.form.get(feat)
+            if raw is None:
+                # If any expected field missing, raise
+                raise ValueError(f"Missing field: {feat}")
+            values.append(float(raw))
+
+        X_input = np.array(values).reshape(1, -1)
+
+        # use pipeline to predict
+        pred_proba = None
+        if hasattr(MODEL, 'predict_proba'):
+            pred_proba = MODEL.predict_proba(X_input)[0]
+            prob_positive = float(pred_proba[1])
+        else:
+            # fallback to decision function
+            prob_positive = float(MODEL.decision_function(X_input)[0])
+            # map to 0..1 via sigmoid for display
+            prob_positive = 1 / (1 + np.exp(-prob_positive))
+
+        pred = int(MODEL.predict(X_input)[0])
+
+        label = 'High risk of chronic disease' if pred == 1 else 'Low risk of chronic disease'
+        prediction_text = f"Prediction: {label} (probability: {prob_positive:.3f})"
+
+        # prepare report data with model metrics
+        report = {
+            'Model': MODEL_META.get('model_name') if MODEL_META else 'unknown',
+            'Predicted label': int(pred),
+            'Probability_positive': round(prob_positive, 4)
+        }
+        if MODEL_META and 'metrics' in MODEL_META:
+            report.update({
+                'Training accuracy': round(MODEL_META['metrics']['accuracy'], 4),
+                'Training precision': round(MODEL_META['metrics']['precision'], 4),
+                'Training recall': round(MODEL_META['metrics']['recall'], 4),
+                'Training f1': round(MODEL_META['metrics']['f1'], 4)
+            })
+
+        return render_template('predict.html', prediction_text=prediction_text, report_data=report)
+
+    except Exception as e:
+        return render_template('predict.html', prediction_text=f"Error: {e}", report_data=None)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true', help='Train models and save best')
+    args = parser.parse_args()
+
+    if args.train:
+        train_and_save_best()
+    load_model()
+    # run flask app
+    app.run(debug=True)
